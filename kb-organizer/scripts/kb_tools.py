@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""
+kb_tools.py - kb-organizer skill 的确定性辅助工具（随 skill 版本走，见 CHANGELOG.md）
+
+设计原则：能用代码保证正确的事（哈希对比、manifest读写、front-matter抽取）
+都放在这里，不要靠模型自己"记得"或"猜"文件有没有变化过。
+
+子命令:
+  init            初始化知识库目录骨架 (_meta/manifest.json, _meta/taxonomy.md, _inbox/)
+  get-config      读取已保存的交互/处理策略偏好（_meta/config.json），没有就返回found:false
+  set-config      保存交互模式(interactive/silent)和处理策略(smart/light/deep)，后续运行复用
+  scan            对比源目录与manifest，输出 new/changed/unchanged/deleted 文件列表(JSON)
+  update-manifest 处理完一个源文件后，登记它在manifest中的记录（每篇处理完就调用一次，
+                   不要攒到最后一起登记，保证中断后可以从断点继续）。落点用可重复的
+                   --target 参数传（不是JSON字符串），一篇文档落到几个页面就传几次
+  remove-entry    源文件已被删除时，从manifest中移除记录（不会自动删除已生成的知识库页面）
+  list-targets    列出某个分类目录下所有已有页面的 front-matter 摘要，同时自动定位并返回
+                   taxonomy.md 里这个目录对应的说明/备注——不需要模型另外记得去打开
+                   taxonomy.md 查一遍，每次调用这个命令就自动带出来了
+  retarget        子目录拆分、挪动已归档页面后，同步更新那些源文件在manifest里的targets记录
+                   （只改targets，不动hash/status/title等其它字段，避免误判成"内容变了"）
+  gen-index       为知识库树每一层生成/刷新 index.md（OKF风格：列出子目录+本层页面，
+                   各带一句话说明，供不认识本skill的人或其它agent直接浏览）
+  log-entry       往知识库根目录 log.md 追加本轮的变更记录（OKF风格：按日期分组的
+                   人类可读叙事历史，和 manifest.json 这种机器比对用的记录是两回事）
+
+设计说明3（OKF）：index.md 和 log.md 借鉴自 Google 的 Open Knowledge Format 约定。
+gen-index 每次全量重新生成整棵树（成本很低，只读front-matter不用算hash），不做增量
+判断，图的是简单可靠、不会有"该更新的目录没更新"的遗漏。log-entry 只做追加，不改写
+历史条目——log.md 是给人看的叙事，manifest.json 才是给脚本比对用的事实来源，两者
+分工不同，不要试图用一个替代另一个。
+
+设计说明2：list-targets 原本只返回候选目录下已有页面列表，"要不要检查taxonomy.md里
+有没有留过前瞻性备注"完全靠模型自己记得去做，实测下来经常被漏掉——即使备注写对了，
+增量运行时也不一定会被翻出来看。现在改成 list-targets 强制要求同时传 --kb-dir，自动
+按标题层级去 taxonomy.md 里匹配这个目录对应的条目并把说明/备注一起返回，这样"检查
+有没有备注"这件事不再是一个可以被跳过的可选步骤，而是每次调用都会自动发生的事。
+
+设计说明：早期版本里 update-manifest / retarget 的落点是要求传一个JSON数组字符串
+（比如 '["a.md","b.md"]'），结果在Windows的cmd/PowerShell下经常因为单引号和JSON内部
+双引号互相打架而解析失败，模型解决不了只能去手改manifest.json，风险更大。现在改成
+可重复的 --target 参数，全程只用最简单的双引号，不需要在shell里嵌套引号。
+"""
+import argparse
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def load_manifest(meta_dir: Path) -> dict:
+    mf = meta_dir / "manifest.json"
+    if not mf.exists():
+        return {"version": 1, "updated_at": None, "entries": {}}
+    with open(mf, "r", encoding="utf-8") as f:
+        text = f.read()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        print(
+            f"❌ {mf} 不是合法 JSON，无法读取（{e}）。\n"
+            "这个文件只应该由 kb_tools.py 自己写，如果最近手动编辑过，多半是这里出的问题——"
+            "常见原因是多写/少写了一个逗号或引号。可以先用 `python3 -m json.tool "
+            f"{mf}` 检查具体哪里错了，改好之后再重试。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def save_manifest(meta_dir: Path, manifest: dict):
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    mf = meta_dir / "manifest.json"
+    manifest["updated_at"] = now_iso()
+    tmp = mf.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    tmp.replace(mf)  # 原子替换，避免半写坏掉manifest
+
+
+def _parse_taxonomy_blocks(taxonomy_path: Path):
+    """把 taxonomy.md 按标题行切成 (level, heading_text, body_text) 的顺序列表。
+    约定：## 对应目录深度1（一级分类），### 对应深度2，#### 对应深度3，##### 对应深度4。
+    """
+    if not taxonomy_path.exists():
+        return []
+    lines = taxonomy_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    blocks = []
+    cur_level, cur_heading, cur_body = None, None, []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            level = len(stripped) - len(stripped.lstrip("#"))
+            heading_text = stripped.lstrip("#").strip()
+            if cur_heading is not None:
+                blocks.append((cur_level, cur_heading, "\n".join(cur_body).strip()))
+            cur_level, cur_heading, cur_body = level, heading_text, []
+        else:
+            cur_body.append(line)
+    if cur_heading is not None:
+        blocks.append((cur_level, cur_heading, "\n".join(cur_body).strip()))
+    return blocks
+
+
+def find_taxonomy_note(taxonomy_path: Path, category_path: str) -> dict:
+    """给定一个相对于kb-dir的目录路径（比如 "01-系统架构/01-fins系统"），
+    在taxonomy.md里按标题层级逐级匹配，返回匹配到的最深一级标题的说明/备注文本。
+    匹配不到就如实说明匹配到了第几级、卡在哪一段——不要瞎猜返回空结果掩盖过去。
+    """
+    segments = [s for s in category_path.strip("/").split("/") if s]
+    blocks = _parse_taxonomy_blocks(taxonomy_path)
+    if not segments:
+        return {"found": False, "reason": "empty category path"}
+    if not blocks:
+        return {"found": False, "reason": "taxonomy.md 不存在或没有任何标题"}
+
+    target_level = 2  # ## 对应第一级
+    search_start = 0
+    matched_idx = None
+    matched_path = []
+    parent_level = None  # 已匹配到的父级标题的层级；None 表示还在找最顶层，此时不设边界
+    for seg in segments:
+        matched_idx = None
+        i = search_start
+        while i < len(blocks):
+            lvl, heading, _ = blocks[i]
+            if parent_level is not None and lvl <= parent_level:
+                break  # 跑出了当前父级标题的范围（遇到了同级或更高层的标题）
+            if lvl == target_level and heading.startswith(seg):
+                matched_idx = i
+                break
+            i += 1
+        if matched_idx is None:
+            return {
+                "found": False,
+                "reason": f"在第{target_level - 1}级目录里没找到匹配 \"{seg}\" 的标题",
+                "matched_path_so_far": matched_path,
+            }
+        matched_path.append(blocks[matched_idx][1])
+        parent_level = blocks[matched_idx][0]
+        search_start = matched_idx + 1
+        target_level += 1
+
+    lvl, heading, body = blocks[matched_idx]
+    return {"found": True, "matched_heading": heading, "note": body}
+
+
+TAXONOMY_TEMPLATE = """# 知识库分类目录
+
+> 这个文件是知识库的"分类菜单"。每次分类新文档前先读一遍这个文件。
+> 新增顶级分类是"贵"操作，需要人工确认后再加进来，不要在批处理时自动追加。
+> 标题层级约定：## 对应一级分类，### 对应它下面的子目录，#### 再下一级，##### 是第四级
+> （一般不建议拆到这么深）。`list-targets` 会按这个层级自动匹配对应目录的说明文字，
+> 层级写错会导致匹配不到，所以新增/调整标题时要按这个约定来，不要随手加个 #。
+
+## 00-inbox
+说明：暂时无法归类、置信度低、或者需要人工判断该不该新建分类的内容，先放这里。
+这不是一个正式分类，处理时应优先尝试归入下面的正式分类。
+
+"""
+
+
+CONFIG_MODES = {
+    "interaction_mode": ("interactive", "silent"),
+    "processing_mode": ("smart", "light", "deep"),
+}
+
+
+def cmd_get_config(args):
+    kb = Path(args.kb_dir)
+    cfg_path = kb / "_meta" / "config.json"
+    if not cfg_path.exists():
+        print(json.dumps({"found": False}, ensure_ascii=False))
+        return
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(
+            f"❌ {cfg_path} 不是合法 JSON（{e}）。这个文件只应该由 set-config 写，"
+            "如果手动改过，用 `python3 -m json.tool` 检查一下具体哪里错了。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(json.dumps({"found": True, **cfg}, ensure_ascii=False))
+
+
+def cmd_set_config(args):
+    kb = Path(args.kb_dir)
+    meta = kb / "_meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    cfg = {
+        "version": 1,
+        "interaction_mode": args.interaction_mode,
+        "processing_mode": args.processing_mode,
+        "set_at": now_iso(),
+    }
+    cfg_path = meta / "config.json"
+    tmp = cfg_path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    tmp.replace(cfg_path)
+    print(f"config.json 已更新：interaction_mode={args.interaction_mode}, processing_mode={args.processing_mode}")
+
+
+def cmd_init(args):
+    kb = Path(args.kb_dir)
+    meta = kb / "_meta"
+    inbox = kb / "_inbox"
+    meta.mkdir(parents=True, exist_ok=True)
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = meta / "manifest.json"
+    if not manifest_path.exists():
+        save_manifest(meta, {"version": 1, "entries": {}})
+        print(f"created: {manifest_path}")
+    else:
+        print(f"already exists, left untouched: {manifest_path}")
+
+    taxonomy_path = meta / "taxonomy.md"
+    if not taxonomy_path.exists():
+        taxonomy_path.write_text(TAXONOMY_TEMPLATE, encoding="utf-8")
+        print(f"created: {taxonomy_path}")
+    else:
+        print(f"already exists, left untouched: {taxonomy_path}")
+
+
+def cmd_scan(args):
+    source = Path(args.source).resolve()
+    if not source.exists():
+        print(json.dumps({"error": f"source not found: {source}"}, ensure_ascii=False))
+        sys.exit(1)
+
+    kb = Path(args.kb_dir)
+    meta = kb / "_meta"
+    manifest = load_manifest(meta)
+    entries = manifest.get("entries", {})
+
+    current_files = {}
+    for p in sorted(source.rglob("*.md")):
+        rel = str(p.relative_to(source))
+        current_files[rel] = p
+
+    result = {"new": [], "changed": [], "unchanged": [], "deleted": []}
+
+    for rel, p in current_files.items():
+        h = sha256_of(p)
+        prev = entries.get(rel)
+        if prev is None:
+            result["new"].append({"source": rel, "hash": h})
+        elif prev.get("hash") != h:
+            result["changed"].append({
+                "source": rel,
+                "hash": h,
+                "old_hash": prev.get("hash"),
+                "prev_targets": prev.get("targets", []),
+            })
+        else:
+            result["unchanged"].append({
+                "source": rel,
+                "hash": h,
+                "targets": prev.get("targets", []),
+            })
+
+    for rel, prev in entries.items():
+        if rel not in current_files:
+            result["deleted"].append({"source": rel, "targets": prev.get("targets", [])})
+
+    summary = {k: len(v) for k, v in result.items()}
+    print(json.dumps({"summary": summary, **result}, ensure_ascii=False, indent=2))
+
+
+def cmd_update_manifest(args):
+    if not args.target:
+        print(
+            "❌ 至少要传一个 --target（一篇文档落到几个页面就传几次），例如：\n"
+            '  --target "01-系统架构/fins收报模块理解文档.md"\n'
+            "如果一篇源文档合并进了多个页面，重复这个参数就行，不需要写JSON、不需要额外加引号。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    kb = Path(args.kb_dir)
+    meta = kb / "_meta"
+    manifest = load_manifest(meta)
+    entries = manifest.setdefault("entries", {})
+    entries[args.source] = {
+        "hash": args.hash,
+        "status": args.status,
+        "targets": list(args.target),
+        "title": args.title or "",
+        "doc_type": args.doc_type or "",
+        "last_processed": now_iso(),
+    }
+    save_manifest(meta, manifest)
+    print(f"updated manifest entry: {args.source} -> status={args.status}, targets={list(args.target)}")
+
+
+def cmd_remove_entry(args):
+    kb = Path(args.kb_dir)
+    meta = kb / "_meta"
+    manifest = load_manifest(meta)
+    entries = manifest.get("entries", {})
+    if args.source in entries:
+        removed = entries.pop(args.source)
+        save_manifest(meta, manifest)
+        print(f"removed manifest entry: {args.source} (had targets: {removed.get('targets')})")
+    else:
+        print(f"no manifest entry found for: {args.source}")
+
+
+def cmd_retarget(args):
+    if not args.target:
+        print(
+            "❌ 至少要传一个 --target 作为新落点，例如：\n"
+            '  --target "01-系统架构/01-fins系统/fins收报模块理解文档.md"\n'
+            "挪动后落到多个页面就重复传这个参数。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    kb = Path(args.kb_dir)
+    meta = kb / "_meta"
+    manifest = load_manifest(meta)
+    entries = manifest.get("entries", {})
+    if args.source not in entries:
+        print(f"no manifest entry found for: {args.source} (retarget只能用于已登记过的条目)")
+        sys.exit(1)
+    entries[args.source]["targets"] = list(args.target)
+    entries[args.source]["last_processed"] = now_iso()
+    save_manifest(meta, manifest)
+    print(f"retargeted: {args.source} -> {list(args.target)}")
+
+
+def cmd_gen_index(args):
+    """给整棵知识库树的每一层（有内容的目录）生成/覆盖 index.md，参考 OKF 的
+    progressive disclosure 约定：每层列出"子目录"和"本层页面"，各带一句话说明/摘要。
+    全量重新生成，不做增量判断——生成成本很低（只读front-matter，不用算hash），
+    全量重来最简单也最不容易留下过期信息，跟OKF自己给的示例脚本是一个思路。
+    自底向上遍历：只有真正有内容的目录（自己有页面，或者子目录里有内容）才会被
+    列进父级的"子目录"清单，避免生成指向空目录（比如还没有任何内容的 _inbox）的死链接。
+    """
+    kb = Path(args.kb_dir).resolve()
+    taxonomy_path = kb / "_meta" / "taxonomy.md"
+    written = []
+    has_content: dict = {}  # 相对路径(kb-dir下的""表示根) -> 这个目录是否有内容
+
+    for dirpath, dirnames, filenames in os.walk(kb, topdown=False):
+        d = Path(dirpath)
+        if d.name == "_meta":
+            continue  # _meta是脚本自己用的元数据目录，不是知识内容，不进index.md体系
+
+        rel = str(d.relative_to(kb)) if d != kb else ""
+        concept_files = sorted(f for f in filenames if f.endswith(".md") and f not in RESERVED_FILENAMES)
+        sub_dirs = sorted(
+            sd for sd in dirnames
+            if has_content.get(f"{rel}/{sd}" if rel else sd, False)
+        )
+
+        this_has_content = bool(concept_files) or bool(sub_dirs)
+        has_content[rel] = this_has_content
+        if not this_has_content:
+            continue
+
+        lines = [f"# {rel if rel else '知识库总览'}", ""]
+
+        if rel:
+            note = find_taxonomy_note(taxonomy_path, rel)
+            if note.get("found") and note.get("note"):
+                first_line = note["note"].splitlines()[0]
+                if first_line:
+                    lines += [f"> {first_line}", ""]
+
+        if sub_dirs:
+            lines.append("## 子目录")
+            for sd in sub_dirs:
+                sub_rel = f"{rel}/{sd}" if rel else sd
+                sub_note = find_taxonomy_note(taxonomy_path, sub_rel)
+                desc = ""
+                if sub_note.get("found") and sub_note.get("note"):
+                    desc = sub_note["note"].splitlines()[0]
+                entry = f"* [{sd}/]({sd}/index.md)"
+                if desc:
+                    entry += f" — {desc}"
+                lines.append(entry)
+            lines.append("")
+
+        if concept_files:
+            lines.append("## 页面")
+            for cf in concept_files:
+                fp = d / cf
+                try:
+                    text = fp.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    text = ""
+                fm = _parse_front_matter(text)
+                title = fm.get("title") or cf[:-3]
+                desc = fm.get("description", "")
+                concept_type = fm.get("type", "")
+                tags = fm.get("tags", "")
+                ts = _extract_timestamp(fm)
+                entry = f"* [{title}]({cf})"
+                meta_parts = []
+                if concept_type:
+                    meta_parts.append(f"`{concept_type}`")
+                if desc:
+                    meta_parts.append(desc)
+                if tags:
+                    meta_parts.append(f"tags: {tags}")
+                if ts:
+                    meta_parts.append(f"updated: {ts}")
+                if meta_parts:
+                    entry += f" — {' · '.join(meta_parts)}"
+                lines.append(entry)
+            lines.append("")
+
+        content = "\n".join(lines).rstrip() + "\n"
+        (d / "index.md").write_text(content, encoding="utf-8")
+        written.append(str((d / "index.md").relative_to(kb)))
+
+    written.sort()
+    print(f"生成/更新了 {len(written)} 个 index.md：")
+    for w in written:
+        print(f"  {w}")
+
+
+LOG_HEADER = "# Update Log\n"
+
+
+def cmd_log_entry(args):
+    """往知识库根目录的 log.md 追加本轮运行的变更记录，格式参考 OKF：按日期分组、
+    最新的日期在最上面，同一天多次运行就追加到当天的标题下面。这是给人看的叙事性
+    历史，不是给脚本比对用的——manifest.json 才是那个角色，两者不重复也不互相替代。
+    """
+    if not args.entry:
+        print(
+            "❌ 至少要传一个 --entry（一条变更记录传一次，可重复），例如：\n"
+            '  --entry "**Create**: 新建页面 01-系统架构/xxx.md"\n'
+            '  --entry "**Ingest**: 处理 3 篇源文档（1 篇新增、2 篇变更）"',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    kb = Path(args.kb_dir)
+    log_path = kb / "log.md"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if log_path.exists():
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    else:
+        lines = LOG_HEADER.splitlines()
+
+    date_heading = f"## {today}"
+    insert_idx = None
+    for i, line in enumerate(lines):
+        if line.strip() == date_heading:
+            insert_idx = i + 1
+            break
+
+    new_bullets = [f"* {e}" for e in args.entry]
+
+    if insert_idx is not None:
+        lines[insert_idx:insert_idx] = new_bullets
+    else:
+        header_idx = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith("# "):
+                header_idx = i + 1
+                break
+        lines[header_idx:header_idx] = ["", date_heading] + new_bullets
+
+    log_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    print(f"log.md 已更新，追加了 {len(args.entry)} 条记录到 {today}")
+
+
+def _parse_front_matter(text: str) -> dict:
+    fm = {}
+    if not text.startswith("---"):
+        return fm
+    end = text.find("\n---", 3)
+    if end == -1:
+        return fm
+    block = text[3:end].strip("\n")
+    for line in block.splitlines():
+        if ":" in line and not line.strip().startswith("-"):
+            k, _, v = line.partition(":")
+            fm[k.strip()] = v.strip()
+    return fm
+
+
+def _extract_timestamp(fm: dict) -> str:
+    """从 front-matter 提取时间戳，兼容 OKF v0.2 的 generated: { by, at }
+    和旧式的 timestamp 字段。返回 ISO 格式字符串或空字符串。
+    """
+    generated = fm.get("generated", "")
+    if generated and "at:" in generated:
+        # 解析 inline YAML 对象 { by: xxx, at: 2026-06-20T22:53:05Z }
+        import re
+        m = re.search(r"at:\s*(\S+?)(?:[,}\s]|$)", generated)
+        if m:
+            return m.group(1)
+    timestamp = fm.get("timestamp", "")
+    if timestamp:
+        return timestamp
+    return ""
+
+RESERVED_FILENAMES = {"index.md", "log.md"}
+
+
+def cmd_list_targets(args):
+    cat_dir = Path(args.category_dir)
+    pages = []
+    if cat_dir.exists():
+        for p in sorted(cat_dir.rglob("*.md")):
+            if p.name in RESERVED_FILENAMES:
+                continue  # index.md/log.md 是保留文件，不是知识页面，不能被当成合并候选
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            fm = _parse_front_matter(text)
+            pages.append({
+                "path": str(p),
+                "title": fm.get("title", ""),
+                "description": fm.get("description", ""),
+                "type": fm.get("type", ""),
+                "tags": fm.get("tags", ""),
+                "confidence": fm.get("confidence", ""),
+            })
+
+    result = {"pages": pages}
+
+    kb = Path(args.kb_dir)
+    taxonomy_path = kb / "_meta" / "taxonomy.md"
+    try:
+        rel_category = str(cat_dir.resolve().relative_to(kb.resolve()))
+    except ValueError:
+        result["taxonomy_note"] = {
+            "found": False,
+            "reason": "category-dir 不在 kb-dir 之下，没法在 taxonomy.md 里定位对应条目，"
+                      "检查一下 --category-dir 和 --kb-dir 是不是传反了或者路径没对齐",
+        }
+    else:
+        result["taxonomy_note"] = find_taxonomy_note(taxonomy_path, rel_category)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="kb-organizer 辅助工具")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="初始化知识库目录骨架")
+    p.add_argument("--kb-dir", required=True)
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("get-config", help="读取本知识库已保存的交互/处理策略偏好（首次运行时会没有）")
+    p.add_argument("--kb-dir", required=True)
+    p.set_defaults(func=cmd_get_config)
+
+    p = sub.add_parser("set-config", help="保存交互/处理策略偏好到 _meta/config.json，后续运行自动复用")
+    p.add_argument("--kb-dir", required=True)
+    p.add_argument("--interaction-mode", required=True, choices=list(CONFIG_MODES["interaction_mode"]))
+    p.add_argument("--processing-mode", required=True, choices=list(CONFIG_MODES["processing_mode"]))
+    p.set_defaults(func=cmd_set_config)
+
+    p = sub.add_parser("scan", help="扫描源目录，对比manifest输出 new/changed/unchanged/deleted")
+    p.add_argument("--source", required=True)
+    p.add_argument("--kb-dir", required=True)
+    p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("update-manifest", help="处理完一个源文件后登记它的落点")
+    p.add_argument("--kb-dir", required=True)
+    p.add_argument("--source", required=True, help="相对于source root的路径，需与scan输出一致")
+    p.add_argument("--hash", required=True)
+    p.add_argument("--status", required=True, choices=["merged", "new_file", "inbox"])
+    p.add_argument("--target", action="append",
+                    help='落点路径，一篇文档落到几个页面就传几次这个参数，例如 '
+                         '--target "01-a.md" --target "02-b.md"。不用写JSON、不用额外加引号。')
+    p.add_argument("--title")
+    p.add_argument("--doc-type")
+    p.set_defaults(func=cmd_update_manifest)
+
+    p = sub.add_parser("remove-entry", help="源文件已删除时，从manifest中移除记录")
+    p.add_argument("--kb-dir", required=True)
+    p.add_argument("--source", required=True)
+    p.set_defaults(func=cmd_remove_entry)
+
+    p = sub.add_parser("list-targets", help="列出某分类目录下已有页面的front-matter摘要，并自动附带taxonomy.md里对应的说明/备注")
+    p.add_argument("--category-dir", required=True)
+    p.add_argument("--kb-dir", required=True, help="用于在 _meta/taxonomy.md 里定位 category-dir 对应的说明/备注")
+    p.set_defaults(func=cmd_list_targets)
+
+    p = sub.add_parser("retarget", help="挪动已归档页面后，同步更新manifest里的targets")
+    p.add_argument("--kb-dir", required=True)
+    p.add_argument("--source", required=True, help="要更新的源文件路径，需是manifest里已存在的key")
+    p.add_argument("--target", action="append",
+                    help='新的落点路径，可重复传多次，例如 --target "01-a.md" --target "02-b.md"')
+    p.set_defaults(func=cmd_retarget)
+
+    p = sub.add_parser("gen-index", help="为整棵知识库树的每一层生成/刷新 index.md（OKF风格的目录清单）")
+    p.add_argument("--kb-dir", required=True)
+    p.set_defaults(func=cmd_gen_index)
+
+    p = sub.add_parser("log-entry", help="往知识库根目录的 log.md 追加本轮运行的变更记录（OKF风格的可读变更历史）")
+    p.add_argument("--kb-dir", required=True)
+    p.add_argument("--entry", action="append",
+                    help='一条变更记录，可重复传多次，例如 --entry "**Create**: 新建页面 xxx.md"')
+    p.set_defaults(func=cmd_log_entry)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
