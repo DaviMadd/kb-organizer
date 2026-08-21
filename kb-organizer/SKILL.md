@@ -5,7 +5,7 @@ description: 把一批已经转换好的 Markdown 文档（通常来自 doc/xls/
 
 # kb-organizer
 
-> **v6** — 版本历史见 `CHANGELOG.md`（skill 工具本身的演进记录，不是某个知识库实例的 `log.md`，两者别搞混）。
+> **v7** — 版本历史见 `CHANGELOG.md`（skill 工具本身的演进记录，不是某个知识库实例的 `log.md`，两者别搞混）。
 
 ## 解决什么问题
 

@@ -4,6 +4,22 @@
 每个知识库自己的 `log.md` 里，见 SKILL.md Step 6）。每次改动 SKILL.md 或
 `scripts/kb_tools.py` 的行为，都在这里加一条，说明改了什么、为什么改。
 
+## v7 — 2026-08-20
+
+**对齐 OKF（Google Open Knowledge Format）标准字段，`gen-index` 生成的目录条目从只展示 title + summary 改为展示完整的 OKF 结构化字段。**
+
+- `gen-index` 现在从页面 front-matter 读取 `type`、`description`、`tags`、时间戳，
+  生成的 index 条目格式改为 `* [标题](路径) — \`类型\` · 描述 · tags: 标签 · updated: 时间戳`，
+  和 OKF §8 的 progressive disclosure 约定一致。
+- front-matter 摘要字段从 `summary` 改为 OKF 标准的 `description`，`list-targets`
+  返回结果同步对齐，新增返回 `type` 字段。
+- 新增 `_extract_timestamp` 辅助函数：兼容 OKF v0.2 的 `generated: { by, at }` 格式
+  和旧式 `timestamp` 字段，优先取 `generated.at`。
+- `references/frontmatter-and-taxonomy.md` 模板加了 `type`（必填）字段，`summary` →
+  `description`，字段说明标注了对齐 OKF。
+- SKILL.md Step 6 补充了 OKF 核心字段约定的明确说明（`type` 必填、`description` 不是
+  `summary`、index 条目格式、根目录 `okf_version` 等）。
+
 ## v6 — 2026-08-20
 
 **加入运行偏好配置（交互/静默、处理深度分级），并给 SKILL.md 大幅瘦身。**
