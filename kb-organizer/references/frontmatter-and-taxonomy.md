@@ -9,20 +9,23 @@ title: 产品A 功能概述
 category: 01-产品文档/产品A
 description: 产品A的核心功能与审批流程说明
 tags: [产品A, 功能, 支付]
+status: stable
+generated: { by: kb-organizer/v8, at: 2026-08-25T10:00:00Z }
 sources:
-  - path: raw/产品A_功能规格书_v3.md
-    hash: sha256:1a2b3c4d...
-    updated: 2026-08-17
+  - id: 产品A_功能规格书_v3
+    resource: raw/产品A_功能规格书_v3.md
 confidence: high
 ---
 ```
 
-字段说明（对齐 OKF — Google Open Knowledge Format）：
+字段说明（严格对齐 OKF v0.2 — Google Open Knowledge Format）：
 
-- `type`（必填）：概念类型，OKF 唯一强制字段。知识库场景常见值如"产品文档""操作手册""架构设计""运维 SOP""会议纪要"等。`gen-index` 会在目录条目里展示这个类型。
-- `title` / `description` / `tags`：OKF 推荐字段。`description` 是一句话摘要（注意字段名是 `description` 不是 `summary`），`gen-index` 和 `list-targets` 都读这个字段来决定目录条目和合并候选展示。摘要要具体，不要写"介绍了产品A的一些情况"这种空话，写"产品A的核心功能与审批流程说明"这种能让人一眼判断相不相关的内容。
-- `sources`：数组。一页知识可能是从多篇源文档合并而来的，每次合并都往这个数组**追加**一条，不要覆盖旧的来源记录——这是知识库最重要的可追溯性保证，丢了这个信息，出了问题就没法查是哪篇原始文档说的。
-- `confidence`：`high` / `medium` / `low`。`low` 大致等同于放进了 `_inbox` 但因为内容本身分类还算明确就没真放进去的情况，建议在运行报告里单独提一句，方便用户抽查。
+- `type`（必填）：OKF 唯一强制字段。知识库场景常见值如"产品文档""操作手册""架构设计""运维 SOP""会议纪要"等。
+- `title` / `description` / `tags`：OKF 推荐字段。`description` 是一句话摘要，`gen-index` 和 `list-targets` 都读这个字段来决定目录条目和合并候选展示。摘要要具体，不要写"介绍了产品A的一些情况"这种空话。
+- `status`：OKF 生命周期字段（§5.4），`draft` | `stable` | `deprecated`，缺省视为 `stable`。
+- `generated`：OKF 信任字段（§5.2），`by` 必须遵循 actor 约定（§7）——agent 用 `<producer>/<version>` 格式（如 `kb-organizer/v8`），人用 `human:<id>`，自动流程用 `process:<id>`。`at` 是 ISO 8601 时间戳。
+- `sources`：OKF 溯源字段（§5.1），数组。每条必须有 `resource`（OKF 规定 REQUIRED）和可选 `id`（用于正文脚注归因）。一页知识可能是从多篇源文档合并而来的，每次合并都往这个数组**追加**一条，不要覆盖旧的来源记录。
+- `confidence`：非 OKF 标准字段，本 skill 扩展。`high` / `medium` / `low`，`low` 大致等同于放进了 `_inbox` 但因为内容本身分类还算明确就没真放进去的情况。
 
 ## taxonomy.md 格式
 

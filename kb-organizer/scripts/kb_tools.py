@@ -19,16 +19,23 @@ kb_tools.py - kb-organizer skill 的确定性辅助工具（随 skill 版本走�
                    taxonomy.md 查一遍，每次调用这个命令就自动带出来了
   retarget        子目录拆分、挪动已归档页面后，同步更新那些源文件在manifest里的targets记录
                    （只改targets，不动hash/status/title等其它字段，避免误判成"内容变了"）
+  create-page     light 模式专用：LLM 只做分类决策，脚本负责创建页面文件（复制源文件
+                   正文 + 自动生成 OKF front-matter），省去 LLM 逐行抄写的工作
+  quick-classify  light 模式专用：提取源文件的标题、各级标题、首段（不读全文），
+                   输出 JSON 供 LLM 做分类决策，省去读整篇文档的开销
+  merge-append    light 模式合并专用：把源文件正文追加到已有知识库页面末尾，
+                   自动更新目标页面的 sources front-matter，LLM 不读任何文件
   gen-index       为知识库树每一层生成/刷新 index.md（OKF风格：列出子目录+本层页面，
                    各带一句话说明，供不认识本skill的人或其它agent直接浏览）
   log-entry       往知识库根目录 log.md 追加本轮的变更记录（OKF风格：按日期分组的
                    人类可读叙事历史，和 manifest.json 这种机器比对用的记录是两回事）
 
-设计说明3（OKF）：index.md 和 log.md 借鉴自 Google 的 Open Knowledge Format 约定。
-gen-index 每次全量重新生成整棵树（成本很低，只读front-matter不用算hash），不做增量
-判断，图的是简单可靠、不会有"该更新的目录没更新"的遗漏。log-entry 只做追加，不改写
-历史条目——log.md 是给人看的叙事，manifest.json 才是给脚本比对用的事实来源，两者
-分工不同，不要试图用一个替代另一个。
+设计说明3（OKF）：index.md 和 log.md 严格遵循 Google Open Knowledge Format v0.2 约定。
+概念页面 front-matter 必须包含 type（必填）、title、description、tags、status、
+generated（actor 约定见§7）、sources（每条必须有 resource，可选 id）。gen-index 每次
+全量重新生成整棵树（成本很低，只读front-matter不用算hash），不做增量判断。根目录
+index.md 带 okf_version: "0.2" front-matter，其他层级不带。index 条目格式为
+OKF §8 约定的 `* [Title](url) - description`。log-entry 只做追加，不改写历史条目。
 
 设计说明2：list-targets 原本只返回候选目录下已有页面列表，"要不要检查taxonomy.md里
 有没有留过前瞻性备注"完全靠模型自己记得去做，实测下来经常被漏掉——即使备注写对了，
@@ -48,6 +55,8 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+VERSION = "v10"  # 与 CHANGELOG.md / SKILL.md 头部版本号保持一致
 
 
 def now_iso() -> str:
@@ -372,17 +381,25 @@ def cmd_gen_index(args):
         if not this_has_content:
             continue
 
-        lines = [f"# {rel if rel else '知识库总览'}", ""]
+        is_root = not rel
+        lines_buf = []
+
+        # 根目录 index.md 可带 okf_version frontmatter（§12）
+        if is_root:
+            lines_buf += ["---", 'okf_version: "0.2"', "---", ""]
+
+        lines_buf.append(f"# {rel if rel else '知识库总览'}")
+        lines_buf.append("")
 
         if rel:
             note = find_taxonomy_note(taxonomy_path, rel)
             if note.get("found") and note.get("note"):
                 first_line = note["note"].splitlines()[0]
                 if first_line:
-                    lines += [f"> {first_line}", ""]
+                    lines_buf += [f"> {first_line}", ""]
 
         if sub_dirs:
-            lines.append("## 子目录")
+            lines_buf.append("## 子目录")
             for sd in sub_dirs:
                 sub_rel = f"{rel}/{sd}" if rel else sd
                 sub_note = find_taxonomy_note(taxonomy_path, sub_rel)
@@ -391,12 +408,12 @@ def cmd_gen_index(args):
                     desc = sub_note["note"].splitlines()[0]
                 entry = f"* [{sd}/]({sd}/index.md)"
                 if desc:
-                    entry += f" — {desc}"
-                lines.append(entry)
-            lines.append("")
+                    entry += f" - {desc}"
+                lines_buf.append(entry)
+            lines_buf.append("")
 
         if concept_files:
-            lines.append("## 页面")
+            lines_buf.append("## 页面")
             for cf in concept_files:
                 fp = d / cf
                 try:
@@ -406,25 +423,13 @@ def cmd_gen_index(args):
                 fm = _parse_front_matter(text)
                 title = fm.get("title") or cf[:-3]
                 desc = fm.get("description", "")
-                concept_type = fm.get("type", "")
-                tags = fm.get("tags", "")
-                ts = _extract_timestamp(fm)
                 entry = f"* [{title}]({cf})"
-                meta_parts = []
-                if concept_type:
-                    meta_parts.append(f"`{concept_type}`")
                 if desc:
-                    meta_parts.append(desc)
-                if tags:
-                    meta_parts.append(f"tags: {tags}")
-                if ts:
-                    meta_parts.append(f"updated: {ts}")
-                if meta_parts:
-                    entry += f" — {' · '.join(meta_parts)}"
-                lines.append(entry)
-            lines.append("")
+                    entry += f" - {desc}"
+                lines_buf.append(entry)
+            lines_buf.append("")
 
-        content = "\n".join(lines).rstrip() + "\n"
+        content = "\n".join(lines_buf).rstrip() + "\n"
         (d / "index.md").write_text(content, encoding="utf-8")
         written.append(str((d / "index.md").relative_to(kb)))
 
@@ -498,21 +503,199 @@ def _parse_front_matter(text: str) -> dict:
     return fm
 
 
-def _extract_timestamp(fm: dict) -> str:
-    """从 front-matter 提取时间戳，兼容 OKF v0.2 的 generated: { by, at }
-    和旧式的 timestamp 字段。返回 ISO 格式字符串或空字符串。
+def _extract_body(text: str) -> str:
+    """从 markdown 文件中提取正文（去掉 front-matter 部分）。
+    如果没有 front-matter，返回原文。
     """
-    generated = fm.get("generated", "")
-    if generated and "at:" in generated:
-        # 解析 inline YAML 对象 { by: xxx, at: 2026-06-20T22:53:05Z }
-        import re
-        m = re.search(r"at:\s*(\S+?)(?:[,}\s]|$)", generated)
-        if m:
-            return m.group(1)
-    timestamp = fm.get("timestamp", "")
-    if timestamp:
-        return timestamp
-    return ""
+    if not text.startswith("---"):
+        return text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return text
+    # 跳过 closing --- 和紧随的换行
+    body_start = end + 4  # \n--- 是 4 个字符
+    if body_start < len(text) and text[body_start] == "\n":
+        body_start += 1
+    return text[body_start:]
+
+
+def cmd_create_page(args):
+    """light 模式专用：LLM 只做分类决策（定 title/type/description/target），
+    脚本负责创建页面文件——复制源文件正文 + 自动生成 OKF front-matter。
+    省去 LLM 逐行抄写的工作。
+    """
+    kb = Path(args.kb_dir)
+    source = Path(args.source)
+    if not source.exists():
+        print(f"❌ 源文件不存在: {source}", file=sys.stderr)
+        sys.exit(1)
+
+    source_text = source.read_text(encoding="utf-8", errors="ignore")
+    body = _extract_body(source_text)
+
+    # 构建 OKF front-matter
+    source_hash = sha256_of(source)
+    source_id = Path(args.source).stem
+    fm_lines = ["---"]
+    fm_lines.append(f"type: {args.type}")
+    fm_lines.append(f"title: {args.title}")
+    if args.description:
+        fm_lines.append(f"description: {args.description}")
+    if args.tags:
+        fm_lines.append(f"tags: [{args.tags}]")
+    if args.category:
+        fm_lines.append(f"category: {args.category}")
+    fm_lines.append(f"generated: {{ by: kb-organizer/{VERSION}, at: {now_iso()} }}")
+    fm_lines.append("sources:")
+    fm_lines.append(f"  - id: {source_id}")
+    fm_lines.append(f"    resource: {args.source}")
+    if args.confidence:
+        fm_lines.append(f"confidence: {args.confidence}")
+    fm_lines.append("---")
+    fm_lines.append("")
+
+    content = "\n".join(fm_lines) + body
+
+    target_path = kb / args.target
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(content, encoding="utf-8")
+
+    print(json.dumps({
+        "created": str(target_path.relative_to(kb)),
+        "source": str(args.source),
+        "source_hash": source_hash,
+        "title": args.title,
+        "type": args.type,
+    }, ensure_ascii=False, indent=2))
+
+
+def cmd_quick_classify(args):
+    """light 模式专用：提取源文件的元数据（标题、各级标题、首段），不读全文。
+    输出 JSON 供 LLM 做分类决策（定 type/title/description/target）。
+    """
+    source = Path(args.source)
+    if not source.exists():
+        print(f"❌ 源文件不存在: {source}", file=sys.stderr)
+        sys.exit(1)
+
+    text = source.read_text(encoding="utf-8", errors="ignore")
+    # 如果有 front-matter，跳过它
+    body = _extract_body(text)
+    lines = body.splitlines()
+    total_lines = len(lines)
+
+    # 提取标题（第一个 # 开头行）和首段
+    title = ""
+    headings = []
+    first_paragraph_lines = []
+    max_lines = args.max_lines
+
+    # 第一遍：收集所有 headings + 标题
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            headings.append(stripped)
+            if not title and stripped.startswith("# "):
+                title = stripped[2:].strip()
+
+    # 第二遍：提取首段（标题后的第一个非空段落）
+    found_heading = False
+    in_first_para = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            found_heading = True
+            continue
+        if not found_heading and stripped == "":
+            continue
+        if found_heading and stripped == "" and not in_first_para:
+            continue  # 跳过标题后的空行
+        if found_heading and stripped != "":
+            in_first_para = True
+        if in_first_para:
+            if stripped == "":
+                break  # 首段结束
+            if len(first_paragraph_lines) < max_lines:
+                first_paragraph_lines.append(line)
+
+    # 如果没找到 H1 标题，用文件名
+    if not title:
+        title = source.stem
+
+    result = {
+        "file": str(args.source),
+        "title": title,
+        "headings": headings[:20],  # 最多 20 个标题，够用
+        "first_paragraph": "\n".join(first_paragraph_lines[:max_lines]),
+        "total_lines": total_lines,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_merge_append(args):
+    """light 模式合并专用：把源文件正文追加到已有知识库页面末尾，
+    自动更新目标页面的 sources front-matter。LLM 不读任何文件。
+    """
+    kb = Path(args.kb_dir)
+    source = Path(args.source)
+    target = kb / args.target
+
+    if not source.exists():
+        print(f"❌ 源文件不存在: {source}", file=sys.stderr)
+        sys.exit(1)
+    if not target.exists():
+        print(f"❌ 目标页面不存在: {target}（merge-append 只能追加到已有页面）", file=sys.stderr)
+        sys.exit(1)
+
+    source_text = source.read_text(encoding="utf-8", errors="ignore")
+    source_body = _extract_body(source_text)
+    source_hash = sha256_of(source)
+    source_id = source.stem
+
+    target_text = target.read_text(encoding="utf-8", errors="ignore")
+
+    # 追加内容：用二级标题分隔
+    label = args.label or source.stem
+    append_block = f"\n\n## 来自 {label}（合并于{datetime.now(timezone.utc).strftime('%Y-%m-%d')}）\n\n{source_body.rstrip()}\n"
+    target_text += append_block
+
+    # 更新 front-matter 的 sources 数组：在 sources: 块末尾插入新条目
+    fm_end = target_text.find("\n---", 3)
+    if fm_end != -1:
+        fm_block = target_text[3:fm_end].strip("\n")
+        new_entry = f"  - id: {source_id}\n    resource: {args.source}"
+        if "sources:" in fm_block:
+            # 找到 sources: 行，然后找到这个数组的结束位置（下一个顶层 key）
+            fm_lines = fm_block.split("\n")
+            insert_idx = None
+            in_sources = False
+            for i, line in enumerate(fm_lines):
+                if line.startswith("sources:"):
+                    in_sources = True
+                    continue
+                if in_sources:
+                    # sources 数组内的行以空格开头
+                    if line and not line.startswith(" "):
+                        insert_idx = i
+                        break
+            if insert_idx is None:
+                # sources 是最后一个 key，追加到末尾
+                fm_block += f"\n{new_entry}"
+            else:
+                fm_lines.insert(insert_idx, new_entry)
+                fm_block = "\n".join(fm_lines)
+        else:
+            fm_block += f"\nsources:\n{new_entry}"
+        target_text = "---\n" + fm_block + "\n---" + target_text[fm_end + 4:]
+
+    target.write_text(target_text, encoding="utf-8")
+
+    print(json.dumps({
+        "merged_into": str(target.relative_to(kb)),
+        "source": str(args.source),
+        "source_hash": source_hash,
+        "source_id": source_id,
+    }, ensure_ascii=False, indent=2))
 
 RESERVED_FILENAMES = {"index.md", "log.md"}
 
@@ -607,6 +790,30 @@ def main():
     p.add_argument("--target", action="append",
                     help='新的落点路径，可重复传多次，例如 --target "01-a.md" --target "02-b.md"')
     p.set_defaults(func=cmd_retarget)
+
+    p = sub.add_parser("create-page", help="light 模式：LLM 定分类决策，脚本创建页面文件（复制正文+自动生成 OKF front-matter）")
+    p.add_argument("--kb-dir", required=True)
+    p.add_argument("--source", required=True, help="源 md 文件路径")
+    p.add_argument("--target", required=True, help="目标页面路径（相对于 kb-dir），例如 01-产品文档/产品A/功能概述.md")
+    p.add_argument("--title", required=True, help="页面标题")
+    p.add_argument("--type", required=True, help="OKF 概念类型，例如 产品文档、操作手册、架构设计")
+    p.add_argument("--description", default="", help="一句话摘要（OKF description 字段）")
+    p.add_argument("--tags", default="", help="标签，逗号分隔，例如 产品A,功能,支付")
+    p.add_argument("--category", default="", help="分类目录路径，写入 front-matter 的 category 字段")
+    p.add_argument("--confidence", default="", choices=["high", "medium", "low"], help="分类置信度")
+    p.set_defaults(func=cmd_create_page)
+
+    p = sub.add_parser("quick-classify", help="light 模式：提取源文件标题/headings/首段，输出 JSON 供 LLM 做分类决策（不读全文）")
+    p.add_argument("--source", required=True, help="源 md 文件路径")
+    p.add_argument("--max-lines", type=int, default=15, help="首段最多提取多少行（默认 15）")
+    p.set_defaults(func=cmd_quick_classify)
+
+    p = sub.add_parser("merge-append", help="light 模式合并：把源文件正文追加到已有知识库页面末尾，自动更新 sources")
+    p.add_argument("--kb-dir", required=True)
+    p.add_argument("--source", required=True, help="源 md 文件路径")
+    p.add_argument("--target", required=True, help="目标页面路径（相对于 kb-dir），必须是已有页面")
+    p.add_argument("--label", default="", help="合并小节标题（默认用源文件名）")
+    p.set_defaults(func=cmd_merge_append)
 
     p = sub.add_parser("gen-index", help="为整棵知识库树的每一层生成/刷新 index.md（OKF风格的目录清单）")
     p.add_argument("--kb-dir", required=True)

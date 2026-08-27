@@ -4,6 +4,54 @@
 每个知识库自己的 `log.md` 里，见 SKILL.md Step 6）。每次改动 SKILL.md 或
 `scripts/kb_tools.py` 的行为，都在这里加一条，说明改了什么、为什么改。
 
+## v10 — 2026-08-27
+
+**light 模式彻底不读全文：新增 `quick-classify` 和 `merge-append` 两个子命令。**
+
+之前 light 模式虽然用 `create-page` 省了“写”的开销，但 LLM 仍然被要求读全文做
+分类判断和矛盾检测，实际跑起来耗时并没有减少多少。v10 把“读”的开销也交给脚本。
+
+- 新增 `quick-classify` 子命令：提取源文件的标题、各级标题、首段（默认前 15 行），
+  输出 JSON 供 LLM 做分类决策。LLM 不读源文件正文。
+- 新增 `merge-append` 子命令：把源文件正文追加到已有知识库页面末尾，自动更新
+  目标页面的 sources front-matter。light 模式合并时 LLM 不读任何文件。
+- SKILL.md 原则 5 修改：明确 light 模式只读元数据，不读全文。
+- SKILL.md Step 3 修改：分类判断分模式指定读取范围——deep/smart 读全文，
+  light 调 `quick-classify`。矛盾检测改为 deep/smart 模式才做，light 跳过。
+- SKILL.md Step 4 合并路径修改：light 模式合并调 `merge-append`，不读文件。
+- SKILL.md Step 3 “light 模式执行捷径”改为“light 模式完整执行流程”，
+  明确 4 步流程：quick-classify → create-page/merge-append → update-manifest。
+
+## v9 — 2026-08-25
+
+**严格对齐 OKF v0.2 规范，修复多处不符合标准的字段格式。**
+
+- `sources` 格式修复：`path` → `resource`（OKF §5.1 规定每条必须有 `resource`），
+  新增 `id` 字段（用于正文脚注归因），移除 `hash`/`updated`（非 OKF 标准字段）。
+- `generated.by` 改为 OKF actor 约定（§7）：`kb-organizer` → `kb-organizer/v8`
+  （`<producer>/<version>` 格式）。
+- index.md 格式修复（§8）：条目分隔符从 ` — ` 改为 ` - `，去掉 type/tags/timestamp
+  等额外元数据，只保留 `* [标题](路径) - 描述`，和 OKF 规范示例一致。
+- 根目录 index.md 新增 `okf_version: "0.2"` front-matter（§12）。
+- 移除 `_extract_timestamp` 辅助函数（index 不再展示时间戳）。
+- `references/frontmatter-and-taxonomy.md` 模板更新：加 `status`/`generated` 字段，
+  `sources` 格式对齐 OKF，字段说明标注各字段对应的 OKF 章节。
+- SKILL.md Step 6 更新 OKF 字段约定描述，引用具体章节号。
+
+## v8 — 2026-08-21
+
+**新增 `create-page` 子命令，light 模式下 LLM 不再逐行抄写正文。**
+
+- 新增 `create-page` 子命令：LLM 只做分类决策（title/type/description/target），
+  脚本负责创建页面文件——读取源文件正文（自动跳过源文件自带的 front-matter）、
+  生成 OKF 标准 front-matter（含 type/title/description/tags/sources/hash/generated）、
+  创建目标文件及父目录。light/smart-light 模式下新建页面改用这个命令，不再
+  由 LLM 手动写 front-matter + 抄正文。
+- 新增 `_extract_body` 辅助函数：从 markdown 文件中剥离 front-matter 部分，
+  只返回正文内容。
+- SKILL.md Step 3 补充“light 模式的执行捷径”说明，Step 4 “新建页面”分支
+  改为 light 模式下调 `create-page`、deep 模式下仍由 LLM 综合改写。
+
 ## v7 — 2026-08-20
 
 **对齐 OKF（Google Open Knowledge Format）标准字段，`gen-index` 生成的目录条目从只展示 title + summary 改为展示完整的 OKF 结构化字段。**

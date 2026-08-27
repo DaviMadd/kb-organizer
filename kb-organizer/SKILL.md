@@ -5,7 +5,7 @@ description: 把一批已经转换好的 Markdown 文档（通常来自 doc/xls/
 
 # kb-organizer
 
-> **v7** — 版本历史见 `CHANGELOG.md`（skill 工具本身的演进记录，不是某个知识库实例的 `log.md`，两者别搞混）。
+> **v10** — 版本历史见 `CHANGELOG.md`（skill 工具本身的演进记录，不是某个知识库实例的 `log.md`，两者别搞混）。
 
 ## 解决什么问题
 
@@ -23,7 +23,7 @@ description: 把一批已经转换好的 Markdown 文档（通常来自 doc/xls/
 2. **写入动作要可追溯、可撤销。** 页面 front-matter 记录来源文件和 hash；冲突显式标注在正文里，不能用新信息悄悄覆盖旧信息。
 3. **目录增长要有人把关，但该拆的时候不能装看不见。** 新建一级分类或往下再拆一层，都要走"先提出来、按 `interaction_mode` 决定是等确认还是自动执行"的流程（细节见 Step 4），不因为层级已经比较深就放松标准。执行拆分必须**对称**——涉及这个维度的所有旧文件要和新文件一起挪，不能只给新内容建目录、把旧文件晾在原地。目录深度一般不超过 3~4 级，超过通常说明该拆的是"单篇页面太长"，不是"目录不够细"。
 4. **增量更新靠 hash，不靠记忆。** 每次先跑 `scan`，让脚本告诉你什么变了。
-5. **处理深度不是默认拉满的选项。** 分类判断（读文件、定分类、写摘要）每篇都做；深度提炼重组只在 `processing_mode` 要求或确有必要时才做，默认轻量。详见 Step 3。
+5. **处理深度不是默认拉满的选项。** 分类判断每篇都做，但 light 模式只读元数据（标题 + headings + 首段，用 `quick-classify` 提取），不读全文；深度提炼重组只在 `processing_mode` 要求或确有必要时才做，默认轻量。详见 Step 3。
 
 ## 目录结构
 
@@ -91,7 +91,10 @@ python3 scripts/kb_tools.py scan --source <源md目录> --kb-dir <kb-dir>
 
 ### Step 3 — 分类判断（每篇都做）+ 深度提炼（按条件触发）
 
-**分类判断，不管什么模式都要做**：读全文，判断文档类型、拟标题、写一句摘要（可以直接摘原文第一句或小标题，不用精心组织）、判断归入 taxonomy 哪个分类、给自己一个置信度判断。这是分类的最低限度信息，省不掉。
+**分类判断，不管什么模式都要做**：判断文档类型、拟标题、写一句摘要、判断归入 taxonomy 哪个分类、给自己一个置信度判断。但**读取范围因模式而异**：
+
+- **deep / smart 模式**：读全文，充分理解内容后再做判断。
+- **light 模式**：**不读全文**。调 `quick-classify` 提取标题、各级标题、首段（默认前 15 行），基于这些元数据做分类决策。摘要直接从标题或首段摘取，不用精心组织。
 
 **深度提炼**（挑值得沉淀的内容、去转换噪音、重组表达）——按 `processing_mode` 触发：
 
@@ -99,7 +102,16 @@ python3 scripts/kb_tools.py scan --source <源md目录> --kb-dir <kb-dir>
 - `light`：都不做，即便要合并（合并方式见 Step 4 的"轻量合并"）。
 - `smart`（默认）：满足其一才做——这篇要合并进已有页面（需要综合才有意义，不是简单拼接）；或原文有明显转换噪音（页眉页脚、导航栏残留、大段重复模板文字）。其余按轻量处理。
 
-**不管什么模式，读到内容矛盾都要标注**（见 `references/merge-and-conflict-conventions.md`）——这是安全机制，不受处理深度设置影响。
+**内容矛盾标注**：deep / smart 模式下读到内容矛盾都要标注（见 `references/merge-and-conflict-conventions.md`）——这是安全机制。**light 模式跳过矛盾检测**——内容原样复制，不消化不检查，代价是可能漏掉矛盾，换取处理速度。
+
+**light 模式的完整执行流程**（LLM 不读全文，全程只出决策）：
+
+1. 调 `quick-classify` 提取元数据 → 基于标题/headings/首段做分类决策
+2. 新建页面：调 `create-page`（脚本复制正文 + 生成 front-matter）
+3. 合并页面：调 `merge-append`（脚本追加正文 + 更新 sources）
+4. 调 `update-manifest` 登记
+
+LLM 全程不读源文件正文，只做路由决策（type/title/description/target）。
 
 ### Step 4 — 落位决策：合并 / 新建 / 子目录拆分 / inbox
 
@@ -122,9 +134,32 @@ python3 scripts/kb_tools.py list-targets --kb-dir <kb-dir> --category-dir <kb-di
 
 **候选页面主题重合** → 合并，按 Step 3 判定的处理深度分两种写法：
 - **深度**：打开候选页面全文，综合改写，front-matter `sources` 追加来源；矛盾内容显式标注（见 `references/merge-and-conflict-conventions.md`）。
-- **轻量**：不改写已有内容，在文末追加 `## 来自 <源文件名>（合并于<日期>）` 小节，新内容基本原样放入；`sources` 照样要追加。**矛盾内容不管深浅都要标注**。
+- **轻量（light 模式）**：LLM 不读任何文件，调 `merge-append` 让脚本直接把源文件正文追加到目标页面末尾，自动更新 sources：
 
-**没有合适候选页面，分类明确** → 新建页面，front-matter 按 `references/frontmatter-and-taxonomy.md` 模板；轻量模式下摘要直接摘原文即可。
+```bash
+python3 scripts/kb_tools.py merge-append --kb-dir <kb-dir> \
+  --source "<源文件路径>" \
+  --target "01-产品文档/已有页面.md" \
+  --label "源文档简称"
+```
+
+脚本自动完成：提取源文件正文、追加到目标页面、用 `## 来自 XX（合并于日期）` 分隔、更新 front-matter sources 数组。**矛盾内容在 light 模式下不检测**（见 Step 3）。
+
+**没有合适候选页面，分类明确** → 新建页面。light/smart-light 模式下用 `create-page` 让脚本自动创建，不用手动抄写：
+
+```bash
+python3 scripts/kb_tools.py create-page --kb-dir <kb-dir> \
+  --source "<源文件路径>" \
+  --target "01-产品文档/产品A/功能概述.md" \
+  --title "产品A 功能概述" \
+  --type "产品文档" \
+  --description "产品A的核心功能与审批流程说明" \
+  --tags "产品A,功能,支付" \
+  --category "01-产品文档/产品A" \
+  --confidence high
+```
+
+脚本自动完成：读取源文件正文（跳过源文件自带的 front-matter）、生成 OKF 标准 front-matter（含 type/title/description/tags/sources/hash/generated）、创建目标文件及父目录。LLM 不需要逐行抄写内容。deep 模式下仍然由 LLM 综合改写正文，不用 `create-page`。
 
 **分类不明确/低置信度** → `_inbox/`，front-matter 写清楚"待归类"和判断依据。
 
@@ -153,11 +188,11 @@ python3 scripts/kb_tools.py update-manifest \
 
 ### Step 6 — 刷新 index.md，写 log.md（整批处理完做一次，不用每篇都做）
 
-参考 Google 的 Open Knowledge Format（OKF）约定，让知识库不依赖本 skill 也能被浏览。OKF 的核心字段约定：
+参考 Google 的 Open Knowledge Format（OKF）v0.2 约定，让知识库不依赖本 skill 也能被浏览。核心约定：
 
-- **概念页面 front-matter**：`type`（必填，如"产品文档""操作手册"）、`title`、`description`（一句话摘要，OKF 用这个字段名，不是 summary）、`tags`、`resource`（可选，指向外部资产的 URI）。`gen-index` 读这些字段来生成目录条目。
-- **index.md**：每层列出子目录和本层页面，每条展示 `type`、`title`、`description`、`tags`，格式如 `* [标题](路径) — \`类型\` · 描述 · tags: 标签列表`。根目录 index.md 可带 `okf_version` front-matter。
-- **log.md**：按日期分组的叙事变更历史，最新在最上，日期用 ISO 8601 `YYYY-MM-DD` 格式。
+- **概念页面 front-matter**：`type`（必填）、`title`、`description`（一句话摘要）、`tags`（YAML 列表）、`status`（`draft`/`stable`/`deprecated`）、`generated: { by: <actor>, at: <ISO8601> }`（actor 约定：agent 用 `<producer>/<version>`，人用 `human:<id>`）、`sources`（每条必须有 `resource`，可选 `id` 用于脚注归因）。详见 `references/frontmatter-and-taxonomy.md`。
+- **index.md**（§8）：每层列出子目录和本层页面，格式 `* [标题](路径) - 一句话描述`，用 `-` 分隔。根目录 index.md 带 `okf_version: "0.2"` front-matter，其他层级的 index.md 不带 front-matter。
+- **log.md**（§9）：按日期分组的叙事变更历史，最新在最上，日期用 ISO 8601 `YYYY-MM-DD` 格式。
 
 ```bash
 python3 scripts/kb_tools.py gen-index --kb-dir <kb-dir>
